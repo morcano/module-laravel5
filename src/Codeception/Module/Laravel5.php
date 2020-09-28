@@ -121,11 +121,13 @@ class Laravel5 extends Framework implements ActiveRecord, PartedModule
     {
         $this->config = array_merge(
             [
+                'databases' => '',
                 'cleanup' => true,
                 'run_database_migrations' => false,
                 'database_migrations_path' => null,
                 'run_database_seeder' => false,
                 'database_seeder_class' => '',
+                'database_custom_statement' => '',
                 'environment_file' => '.env',
                 'bootstrap' => 'bootstrap' . DIRECTORY_SEPARATOR . 'app.php',
                 'root' => '',
@@ -177,17 +179,72 @@ class Laravel5 extends Framework implements ActiveRecord, PartedModule
 
         // Database migrations should run before database cleanup transaction starts
         if ($this->config['run_database_migrations']) {
-            $this->callArtisan('migrate', ['--path' => $this->config['database_migrations_path']]);
+            if ($this->usesExplicitDatabases()) {
+                $this->migrateExplicitDatabases(explode(',', $this->config['databases']));
+            } else {
+                $this->callArtisan('migrate', ['--path' => $this->config['database_migrations_path']]);
+            }
         }
 
-        if ($this->applicationUsesDatabase() && $this->config['cleanup']) {
-            $this->app['db']->beginTransaction();
-            $this->debugSection('Database', 'Transaction started');
+        if ($this->usesDatabase() && $this->config['cleanup']) {
+            if ($this->usesExplicitDatabases()) {
+                $this->startTransactions(explode(',', $this->config['databases']));
+            } else {
+                $this->app['db']->beginTransaction();
+            }
+            $this->debugSection('Database', 'Transaction started for "' . $this->getStartedConnections() . '"');
         }
 
         if ($this->config['run_database_seeder']) {
-            $this->callArtisan('db:seed', ['--class' => $this->config['database_seeder_class'], '--force' => true ]);
+            if ($this->usesExplicitDatabases()) {
+                $this->seedExplicitDatabases(explode(',', $this->config['databases']));
+            } else {
+                $this->callArtisan('db:seed', ['--class' => $this->config['database_seeder_class'], '--force' => true]);
+            }
         }
+    }
+
+    private function startTransactions(array $databases)
+    {
+        foreach ($databases as $database) {
+            if ($this->config['database_custom_statement'] != '') {
+                $this->app['db']->connection($database)->statement($this->config['database_custom_statement']);
+            }
+            $this->app['db']->connection($database)->beginTransaction();
+        }
+    }
+
+    private function migrateExplicitDatabases(array $databases)
+    {
+        foreach ($databases as $database) {
+            $this->callArtisan('migrate', ['--database' => $database, '--path' => $this->config['database_migrations_path']]);
+        }
+    }
+
+    private function seedExplicitDatabases(array $databases)
+    {
+        foreach ($databases as $database) {
+            $this->callArtisan('db:seed', [
+                '--class'    => $this->config['database_seeder_class'],
+                '--database' => $database,
+                '--force'    => true
+            ]);
+        }
+    }
+
+    private function usesExplicitDatabases()
+    {
+        return $this->config['databases'] !== '';
+    }
+
+    private function usesDatabase()
+    {
+        return $this->applicationUsesDatabase() || $this->config['databases'] !== '';
+    }
+
+    protected function getStartedConnections()
+    {
+        return implode(',', array_keys($this->app['db']->getConnections()));
     }
 
     /**
@@ -197,12 +254,14 @@ class Laravel5 extends Framework implements ActiveRecord, PartedModule
      */
     public function _after(\Codeception\TestInterface $test)
     {
-        if ($this->applicationUsesDatabase()) {
+        if ($this->usesDatabase()) {
             $db = $this->app['db'];
 
             if ($db instanceof \Illuminate\Database\DatabaseManager) {
                 if ($this->config['cleanup']) {
-                    $db->rollback();
+                    foreach ($db->getConnections() as $connection) {
+                        $connection->rollback();
+                    }
                     $this->debugSection('Database', 'Transaction cancelled; all changes reverted.');
                 }
 
@@ -215,10 +274,6 @@ class Laravel5 extends Framework implements ActiveRecord, PartedModule
                     $connection->disconnect();
                 }
             }
-
-            // Remove references to Faker in factories to prevent memory leak
-            unset($this->app[\Faker\Generator::class]);
-            unset($this->app[\Illuminate\Database\Eloquent\Factory::class]);
         }
     }
 
